@@ -172,7 +172,55 @@ if not chosen_features:
 
 # Prepare X,y
 X_full = df_processed[chosen_features].copy()
-y_full = df_processed[target_col].astype(int).copy()
+# --- robust target conversion (replace the previous single-line astype(int) ) ---
+target_series = df_processed[target_col].copy()
+
+# If already numeric-ish, coerce to int (safely)
+if pd.api.types.is_integer_dtype(target_series) or pd.api.types.is_float_dtype(target_series):
+    # fill NaNs with mode/0 then convert
+    if target_series.isnull().any():
+        if not target_series.mode().empty:
+            target_series = target_series.fillna(target_series.mode().iloc[0])
+        else:
+            target_series = target_series.fillna(0)
+    try:
+        y_full = target_series.astype(int).copy()
+    except Exception:
+        # fallback to coercion
+        y_full = pd.to_numeric(target_series, errors='coerce').fillna(0).astype(int).copy()
+else:
+    # Try mapping common textual labels to binary
+    # common positive labels
+    pos_labels = {'satisfied','satisfied ','satisfied\n','satisfied\r','satisfied.' , 'satisfying', 'satisfied_customer', 'satisfiedcustomer', 'satisfied_customer ' }
+    # common negative / not-satisfied labels
+    neg_labels = {'neutral','dissatisfied','neutral/dissatisfied','disloyal','unsatisfied','not satisfied','not_satisfied','neutral '}
+    # build mapping that is case-insensitive & stripped
+    mapped = target_series.astype(str).str.strip().str.lower().map(
+        lambda s: 1 if s in pos_labels else (0 if s in neg_labels else None)
+    )
+
+    # If mapping produced only 0/1 (or with NaNs), fill NaNs by trying heuristic:
+    if set(mapped.dropna().unique()) <= {0, 1} and mapped.notna().sum() > 0:
+        # Fill remaining NaNs with mode of mapped if available, else 0
+        if mapped.mode().shape[0] > 0:
+            mapped = mapped.fillna(mapped.mode().iloc[0])
+        else:
+            mapped = mapped.fillna(0)
+        y_full = mapped.astype(int).copy()
+    else:
+        # Fallback: factorize (will produce 0,1,2,...). If >2 classes, warn and choose binary via factorize result
+        codes, uniques = pd.factorize(target_series)
+        st.warning(f"Target column '{target_col}' was non-numeric; factorizing into integer codes. Unique labels: {list(uniques)}")
+        # If factorization produced >2 labels, you may want to manually map them — currently we'll keep codes as-is.
+        y_full = pd.Series(codes, index=target_series.index, name=target_col).astype(int).copy()
+
+# Quick sanity check and debug help: show the unique values found (only if the debug sidebar option is enabled)
+if 'show_debug' in locals() and show_debug:
+    st.write("DEBUG — target column processed unique values (sample):")
+    st.write(pd.Series(y_full).value_counts().to_frame(name='count'))
+
+# Now y_full is an integer Series suitable for modeling
+
 
 # split & scale (auto-train on load)
 X_train, X_test, y_train, y_test = train_test_split(X_full, y_full, test_size=test_size, random_state=random_state, stratify=y_full if len(y_full.unique())>1 else None)
