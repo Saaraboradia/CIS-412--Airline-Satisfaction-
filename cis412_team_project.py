@@ -1,7 +1,6 @@
 # app_with_shap.py
 # Interactive Streamlit app with sliders, live predictions, sensitivity analysis and SHAP explainer.
 # Requires: streamlit, pandas, numpy, scikit-learn, matplotlib, seaborn, shap (optional but recommended)
-streamlit run app_with_shap.py
 import os
 import io
 import warnings
