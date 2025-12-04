@@ -415,6 +415,19 @@ cls_rf = int(prob_rf >= threshold)
 st.subheader("Predicted probabilities (reflect slider inputs)")
 plot_prob_bar(prob_lr, prob_rf)
 st.write(f"Logistic predicted class: {cls_lr} | RandomForest predicted class: {cls_rf}")
+prob_lr = lr.predict_proba(input_scaled)[0, 1]
+prob_rf = rf.predict_proba(input_scaled)[0, 1]
+# ---- Prediction Result Section ----
+st.subheader("Final Prediction Result")
+
+# Choose a model to report final class (use Random Forest by default)
+threshold = 0.5  # or let this come from a slider earlier in your app
+pred_class = 1 if prob_rf >= threshold else 0
+
+if pred_class == 1:
+    st.success(f"🎉 Prediction: **SATISFIED** (probability = {prob_rf:.3f})")
+else:
+    st.error(f"⚠️ Prediction: **NOT SATISFIED** (probability = {prob_rf:.3f})")
 
 # -------------------------
 # Graphical confusion matrices (replacing textual tables)
@@ -470,3 +483,4 @@ else:
     plot_rf_importances(st.session_state['rf_model'], st.session_state['X_train'].columns)
 
 st.success("Interactive dashboard ready — move sliders and view live confusion matrix graphics.")
+
