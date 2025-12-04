@@ -1,4 +1,493 @@
 # app.py
+# Interactive Streamlit app with prediction / what-if tools
+# Save and run with: streamlit run app.py
+
+import os
+import io
+import warnings
+from typing import List, Tuple, Dict, Any
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# statsmodels optional (used for p-values)
+try:
+    import statsmodels.api as sm
+    HAS_STATSM = True
+except Exception:
+    HAS_STATSM = False
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score, precision_score, recall_score
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+
+warnings.filterwarnings("ignore")
+sns.set_theme()
+
+st.set_page_config(layout="wide", page_title="CIS412 - Interactive What-If Explorer")
+
+st.title("CIS412 — Interactive What-If Prediction Explorer")
+st.markdown(
+    """
+Use the left sidebar to upload your `train.csv`, select features, and retrain models.
+The right panels let you pick an observation (or build a custom one), change feature values,
+and immediately see predicted probabilities and class from Logistic Regression and Random Forest.
+You can also sweep a single feature to see how probability responds (one-at-a-time sensitivity).
+"""
+)
+
+# -------------------------
+# Utility helper functions
+# -------------------------
+def load_data(uploaded_file) -> pd.DataFrame:
+    if uploaded_file is not None:
+        df_local = pd.read_csv(uploaded_file)
+        st.sidebar.success("Uploaded file loaded")
+        return df_local
+    # fallback paths
+    for p in ["./train.csv", "./data/train.csv", "/content/sample_data/train.csv"]:
+        if os.path.exists(p):
+            return pd.read_csv(p)
+    st.sidebar.error("No data found. Upload a CSV in the sidebar.")
+    st.stop()
+
+def preprocess(df: pd.DataFrame, impute_strategy="median", scale_numeric=True) -> pd.DataFrame:
+    df = df.copy()
+    # impute numeric
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    for col in numeric_cols:
+        if df[col].isnull().any():
+            if impute_strategy == "median":
+                df[col].fillna(df[col].median(), inplace=True)
+            else:
+                df[col].fillna(df[col].mean(), inplace=True)
+    # impute categorical
+    cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+    for col in cat_cols:
+        if df[col].isnull().any():
+            if df[col].mode().shape[0] > 0:
+                df[col].fillna(df[col].mode()[0], inplace=True)
+    # convert negative delays -> 0 if present
+    for c in ['Departure Delay in Minutes', 'Arrival Delay in Minutes']:
+        if c in df.columns:
+            df[c] = df[c].apply(lambda x: x if pd.isna(x) else max(x, 0))
+    # one-hot encode any remaining object/category columns (but don't touch target)
+    return df
+
+def get_target_column(df: pd.DataFrame) -> str:
+    if 'satisfaction_satisfied' in df.columns:
+        return 'satisfaction_satisfied'
+    candidates = [c for c in df.columns if 'satisfaction' in c.lower()]
+    # if single candidate, return it
+    if len(candidates) == 1:
+        return candidates[0]
+    # else try to find binary
+    for c in candidates:
+        vals = set(df[c].dropna().unique())
+        if vals <= {0, 1}:
+            return c
+    # if none, ask user
+    return None
+
+def safe_add_const(X: pd.DataFrame) -> pd.DataFrame:
+    X2 = X.copy()
+    if 'const' not in X2.columns:
+        X2.insert(0, 'const', 1.0)
+    return X2
+
+def train_models(X: pd.DataFrame, y: pd.Series, random_state=42) -> Tuple[LogisticRegression, RandomForestClassifier]:
+    """Train sklearn logistic (for predictions) and RF. Return (logistic, rf)."""
+    # logistic with balanced class_weight if imbalanced
+    lr = LogisticRegression(max_iter=2000)
+    rf = RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1)
+    lr.fit(X, y)
+    rf.fit(X, y)
+    return lr, rf
+
+def evaluate_models(lr, rf, X_train, X_test, y_train, y_test) -> pd.DataFrame:
+    rows = []
+    # logistic
+    y_train_pred_lr = lr.predict(X_train)
+    y_test_pred_lr = lr.predict(X_test)
+    rows.append({
+        "Model": "Logistic",
+        "Split": "Train",
+        "Accuracy": accuracy_score(y_train, y_train_pred_lr),
+        "Precision": precision_score(y_train, y_train_pred_lr, zero_division=0),
+        "Recall": recall_score(y_train, y_train_pred_lr, zero_division=0)
+    })
+    rows.append({
+        "Model": "Logistic",
+        "Split": "Test",
+        "Accuracy": accuracy_score(y_test, y_test_pred_lr),
+        "Precision": precision_score(y_test, y_test_pred_lr, zero_division=0),
+        "Recall": recall_score(y_test, y_test_pred_lr, zero_division=0)
+    })
+    # rf
+    y_train_pred_rf = rf.predict(X_train)
+    y_test_pred_rf = rf.predict(X_test)
+    rows.append({
+        "Model": "RandomForest",
+        "Split": "Train",
+        "Accuracy": accuracy_score(y_train, y_train_pred_rf),
+        "Precision": precision_score(y_train, y_train_pred_rf, zero_division=0),
+        "Recall": recall_score(y_train, y_train_pred_rf, zero_division=0)
+    })
+    rows.append({
+        "Model": "RandomForest",
+        "Split": "Test",
+        "Accuracy": accuracy_score(y_test, y_test_pred_rf),
+        "Precision": precision_score(y_test, y_test_pred_rf, zero_division=0),
+        "Recall": recall_score(y_test, y_test_pred_rf, zero_division=0)
+    })
+    return pd.DataFrame(rows)
+
+def build_input_widgets(feature_list: List[str], reference_row: pd.Series = None) -> Dict[str, Any]:
+    """
+    For each feature in feature_list, create a widget and return dict of values.
+    If reference_row provided, prefill values from it.
+    Support numeric (slider/number_input) and binary (selectbox), and small categorical (selectbox).
+    """
+    input_vals = {}
+    st.markdown("### Build / edit custom observation")
+    cols = st.columns(2)
+    for i, feat in enumerate(feature_list):
+        col = cols[i % 2]
+        # determine dtype from global df_types
+        dtype = df_types.get(feat, "numeric")
+        if reference_row is not None:
+            default = reference_row.get(feat, 0.0)
+        else:
+            default = feature_defaults.get(feat, 0.0)
+        if dtype == "binary":
+            val = col.selectbox(f"{feat}", options=[0, 1], index=0 if default==0 else 1)
+        elif dtype == "categorical":
+            opts = categorical_values.get(feat, ["NA"])
+            # ensure default is in opts
+            if default not in opts:
+                default = opts[0]
+            val = col.selectbox(f"{feat}", options=opts, index=opts.index(default))
+        else:  # numeric
+            # use min/max based on observed distribution
+            lo, hi = feature_ranges.get(feat, (0.0, 1.0))
+            # provide a number_input with reasonable step
+            step = (hi - lo) / 100 if (hi - lo) > 0 else 1.0
+            val = col.number_input(f"{feat}", value=float(default), min_value=float(lo), max_value=float(hi), step=float(step))
+        input_vals[feat] = val
+    return input_vals
+
+def predict_from_input(lr_model, rf_model, input_df: pd.DataFrame, threshold=0.5) -> Dict[str, Any]:
+    """
+    Return predictions/probabilities for logistic and rf on input_df.
+    """
+    out = {}
+    # ensure columns align (skip const for sklearn)
+    X_for_sk = input_df.drop(columns=['const'], errors='ignore')
+    # logistic (sklearn)
+    prob_lr = lr_model.predict_proba(X_for_sk)[:, 1]
+    cls_lr = (prob_lr >= threshold).astype(int)
+    out['logistic_prob'] = prob_lr
+    out['logistic_class'] = cls_lr
+    # rf
+    prob_rf = rf_model.predict_proba(X_for_sk)[:, 1]
+    cls_rf = (prob_rf >= threshold).astype(int)
+    out['rf_prob'] = prob_rf
+    out['rf_class'] = cls_rf
+    return out
+
+def sweep_feature_and_plot(feature: str, base_input: Dict[str, Any], lr_model, rf_model, n_steps=50):
+    """Vary one numeric feature across range and plot predicted probability."""
+    lo, hi = feature_ranges.get(feature, (0.0, 1.0))
+    xs = np.linspace(lo, hi, n_steps)
+    probs_lr = []
+    probs_rf = []
+    base = base_input.copy()
+    for x in xs:
+        base[feature] = x
+        row = pd.DataFrame([base])
+        # ensure const and order
+        row = row[model_feature_order]
+        pred = predict_from_input(lr_model, rf_model, row, threshold=threshold_slider)
+        probs_lr.append(pred['logistic_prob'][0])
+        probs_rf.append(pred['rf_prob'][0])
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(xs, probs_lr, label='Logistic Prob', marker=None)
+    ax.plot(xs, probs_rf, label='RandomForest Prob', marker=None)
+    ax.set_xlabel(feature)
+    ax.set_ylabel('Predicted probability (class=1)')
+    ax.set_title(f'What-if sweep: {feature}')
+    ax.legend()
+    ax.grid(True)
+    st.pyplot(fig)
+
+# -------------------------
+# Sidebar UI - Data + options
+# -------------------------
+st.sidebar.header("Data & Preprocessing")
+uploaded_file = st.sidebar.file_uploader("Upload train.csv", type=["csv"])
+df_raw = load_data(uploaded_file)
+st.sidebar.write(f"Data shape: {df_raw.shape}")
+
+impute_strategy = st.sidebar.selectbox("Impute numeric with", options=["median", "mean"], index=0)
+scale_numeric = st.sidebar.checkbox("Scale numeric features", value=True)
+test_size = st.sidebar.slider("Test size", 0.05, 0.5, 0.2, 0.05)
+random_state = int(st.sidebar.number_input("Random seed", value=42, step=1))
+
+# preprocess
+df = preprocess(df_raw, impute_strategy=impute_strategy, scale_numeric=scale_numeric)
+
+# identify target
+target_col = get_target_column(df)
+if target_col is None:
+    st.sidebar.error("Cannot auto-detect satisfaction target. Please ensure a 'satisfaction' column exists (e.g., 'satisfaction_satisfied').")
+    st.stop()
+st.sidebar.markdown(f"**Target detected**: `{target_col}`")
+
+# ensure target is binary int
+if df[target_col].dtype != int and df[target_col].dtype != np.int64:
+    # attempt to convert
+    if set(df[target_col].dropna().unique()) <= {0, 1}:
+        df[target_col] = df[target_col].astype(int)
+    else:
+        # if object like 'satisfied'/'dissatisfied', convert to binary by factorizing (warn user)
+        df[target_col], _ = pd.factorize(df[target_col])
+        st.sidebar.info(f"Factorized target {target_col} into binary 0/1.")
+
+# one-hot encode remaining object/category columns (except target)
+object_cols = [c for c in df.select_dtypes(include=['object','category']).columns if c != target_col]
+if object_cols:
+    df = pd.get_dummies(df, columns=object_cols, drop_first=True)
+
+# prepare metadata: feature ranges, types
+all_features = [c for c in df.columns if c != target_col]
+feature_ranges = {}
+df_types = {}
+categorical_values = {}
+feature_defaults = {}
+for c in all_features:
+    ser = df[c]
+    if set(ser.dropna().unique()) <= {0,1}:
+        df_types[c] = "binary"
+        feature_ranges[c] = (0,1)
+        categorical_values[c] = [0,1]
+        feature_defaults[c] = int(ser.median()) if ser.notna().any() else 0
+    elif pd.api.types.is_numeric_dtype(ser):
+        df_types[c] = "numeric"
+        lo, hi = float(ser.min()), float(ser.max())
+        if lo == hi:
+            lo, hi = lo - 1.0, hi + 1.0
+        feature_ranges[c] = (lo, hi)
+        feature_defaults[c] = float(ser.median())
+    else:
+        df_types[c] = "categorical"
+        vals = sorted(list(ser.dropna().unique()))
+        categorical_values[c] = vals
+        feature_defaults[c] = vals[0]
+        feature_ranges[c] = (0, 1)
+
+# Sidebar: choose features to use in models
+st.sidebar.header("Model feature selection")
+default_features = all_features.copy()
+chosen_features = st.sidebar.multiselect("Select features (for modeling & prediction)", options=all_features, default=default_features)
+
+if len(chosen_features) == 0:
+    st.sidebar.error("Select at least one feature.")
+    st.stop()
+
+# Option: include const automatically (sklearn doesn't need it)
+use_scaler = scale_numeric  # we'll scale numeric columns in chosen_features if desired
+
+# Prepare X,y for modeling (sklearn)
+X = df[chosen_features].copy()
+y = df[target_col].copy()
+
+# Scale numeric features if selected
+num_cols_in_X = [c for c in X.columns if df_types.get(c,'numeric') == 'numeric']
+if use_scaler and num_cols_in_X:
+    scaler = StandardScaler()
+    X[num_cols_in_X] = scaler.fit_transform(X[num_cols_in_X])
+    # Save scaled default values
+    for c in num_cols_in_X:
+        feature_defaults[c] = float(X[c].median())
+
+# Add const for statsmodels if used for p-values later
+X_const = safe_add_const(X)
+
+# Sidebar: retrain controls
+st.sidebar.header("Train / Retrain")
+retrain_btn = st.sidebar.button("Train / Retrain models")
+# show precomputed train/test split sizes or allow user to train now
+# We'll train immediately when button pressed or when app first loads
+train_now = retrain_btn or ("models_trained" not in st.session_state)
+
+if train_now:
+    # split
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state, stratify=y if len(y.unique())>1 else None)
+    # train sklearn logistic and rf
+    lr_model, rf_model = train_models(X_train, y_train, random_state)
+    # store in session
+    st.session_state['lr_model'] = lr_model
+    st.session_state['rf_model'] = rf_model
+    st.session_state['X_train'] = X_train
+    st.session_state['X_test'] = X_test
+    st.session_state['y_train'] = y_train
+    st.session_state['y_test'] = y_test
+    st.session_state['model_feature_order'] = X.columns.tolist()
+else:
+    if 'lr_model' not in st.session_state:
+        st.info("Hit 'Train / Retrain models' to train models with the selected features.")
+        st.stop()
+    lr_model = st.session_state['lr_model']
+    rf_model = st.session_state['rf_model']
+    X_train = st.session_state['X_train']
+    X_test = st.session_state['X_test']
+    y_train = st.session_state['y_train']
+    y_test = st.session_state['y_test']
+    model_feature_order = st.session_state['model_feature_order']
+
+# Evaluate and show metrics
+st.subheader("Model evaluation (train & test)")
+metrics_df = evaluate_models(lr_model, rf_model, X_train, X_test, y_train, y_test)
+st.dataframe(metrics_df.style.format({"Accuracy":"{:.3f}", "Precision":"{:.3f}", "Recall":"{:.3f}"}))
+
+# show p-values if statsmodels available (optional)
+if HAS_STATSM:
+    st.subheader("Statsmodels Logit (p-values) [optional]")
+    try:
+        X_const_for_stats = safe_add_const(X)  # const included
+        logit_sm = sm.Logit(y, X_const_for_stats)
+        res_sm = logit_sm.fit(disp=False, maxiter=200)
+        st.text(res_sm.summary().as_text())
+        pvals = res_sm.pvalues.sort_values()
+        st.write("Significant (p < 0.05):")
+        st.dataframe(pvals[pvals < 0.05].to_frame(name='pvalue'))
+    except Exception as e:
+        st.warning(f"statsmodels Logit failed to fit for p-values: {e}")
+
+# -------------------------
+# Interactive prediction area
+# -------------------------
+st.header("Interactive Prediction / What-if")
+
+left_col, right_col = st.columns([1, 2])
+
+with left_col:
+    st.markdown("### Choose an observation")
+    row_choice_mode = st.radio("Pick a source for the base observation", options=["Use a row from dataset", "Build custom from scratch"], index=0)
+
+    if row_choice_mode == "Use a row from dataset":
+        idx = st.number_input("Row index (0-based)", min_value=0, max_value=len(df)-1, value=0, step=1)
+        base_row_full = df.iloc[idx]
+        st.write("Base row (original):")
+        st.dataframe(pd.DataFrame(base_row_full).T)
+        # create base_input limited to chosen_features
+        base_input = {f: (base_row_full[f] if f in base_row_full.index else feature_defaults.get(f, 0)) for f in chosen_features}
+        st.markdown("You can edit the values below and click **Predict**")
+        input_vals = build_input_widgets(chosen_features, reference_row=pd.Series(base_input))
+    else:
+        st.markdown("Build custom observation")
+        input_vals = build_input_widgets(chosen_features, reference_row=None)
+        base_input = input_vals.copy()
+
+    # threshold slider
+    st.markdown("### Decision threshold")
+    threshold_slider = st.slider("Prediction threshold (prob->class)", 0.01, 0.99, 0.5, 0.01)
+
+    # Predict button
+    if st.button("Predict with current input"):
+        # convert input_vals into dataframe (one row), ensure column order matches model's training order
+        input_df = pd.DataFrame([input_vals])
+        # apply same scaling to numeric columns if we scaled earlier
+        if use_scaler and num_cols_in_X:
+            # we used scaler fitted on X earlier; best attempt: transform using that scaler if available in session
+            try:
+                # Refit a scaler on X_train numeric to transform the input consistently
+                s = StandardScaler()
+                s.fit(pd.concat([X_train[num_cols_in_X], X_test[num_cols_in_X]], axis=0))
+                input_df[num_cols_in_X] = s.transform(input_df[num_cols_in_X])
+            except Exception:
+                pass
+
+        # ensure columns order
+        input_df = input_df[model_feature_order]
+        # attach const for statsmodels-like representation if needed
+        input_df_const = safe_add_const(input_df)
+        preds = predict_from_input(lr_model, rf_model, input_df_const, threshold=threshold_slider)
+        st.markdown("### Predictions")
+        st.write("Logistic Regression (sklearn) — probability of class=1:", float(preds['logistic_prob'][0]))
+        st.write("Logistic class (threshold {:.2f}):".format(threshold_slider), int(preds['logistic_class'][0]))
+        st.write("Random Forest — probability of class=1:", float(preds['rf_prob'][0]))
+        st.write("Random Forest class (threshold {:.2f}):".format(threshold_slider), int(preds['rf_class'][0]))
+
+        # show local feature importance approximation: change each numeric feature by +-10% and measure Δprob
+        st.markdown("#### Local sensitivity (±10% numeric change) — change in logistic prob")
+        sens = {}
+        for feat in chosen_features:
+            if df_types.get(feat) == 'numeric':
+                val = float(input_vals[feat])
+                lo = val * 0.9
+                hi = val * 1.1
+                df_lo = input_df_const.copy(); df_hi = input_df_const.copy()
+                df_lo[feat] = lo; df_hi[feat] = hi
+                pred_lo = predict_from_input(lr_model, rf_model, df_lo, threshold=threshold_slider)['logistic_prob'][0]
+                pred_hi = predict_from_input(lr_model, rf_model, df_hi, threshold=threshold_slider)['logistic_prob'][0]
+                sens[feat] = pred_hi - pred_lo
+        if sens:
+            sens_s = pd.Series(sens).sort_values(ascending=False)
+            st.bar_chart(sens_s)
+        else:
+            st.write("No numeric features to compute ±10% sensitivity.")
+
+with right_col:
+    st.markdown("### Prediction explorer visuals")
+    st.markdown("You can sweep a numeric feature to see how predicted probability changes (one-at-a-time).")
+    sweep_feature = st.selectbox("Feature to sweep (numeric only)", options=[f for f in chosen_features if df_types.get(f)=='numeric'])
+    steps = st.slider("Sweep steps", 10, 200, 50)
+    st.markdown("Use the 'Predict' button on the left to set the base observation; then click 'Sweep' to plot.")
+    if st.button("Sweep feature"):
+        # build base_input using last input_vals (we should have one)
+        base_input_for_sweep = input_vals.copy()
+        # ensure input order and types
+        # create input_df to match model_feature_order columns
+        for f in model_feature_order:
+            if f not in base_input_for_sweep:
+                base_input_for_sweep[f] = feature_defaults.get(f, 0)
+        # call sweep plotter
+        model_feature_order = X.columns.tolist()
+        sweep_feature_and_plot(sweep_feature, base_input_for_sweep, lr_model, rf_model, n_steps=steps)
+
+# -----------------------------------------
+# Additional interactive: flip label & retrain simulation
+# -----------------------------------------
+st.header("Simulation: Flip a row's target & retrain (quick experiment)")
+st.markdown("Pick a dataset row; flip its target (0→1 or 1→0), retrain on the modified dataset, and compare Test accuracy.")
+if st.checkbox("Enable flip-and-retrain experiment"):
+    row_idx = st.number_input("Row index to flip", min_value=0, max_value=len(df)-1, value=0, step=1)
+    flip_row = df.iloc[row_idx]
+    st.write("Original target for this row:", int(flip_row[target_col]))
+    flip_action = st.button("Flip & retrain")
+    if flip_action:
+        df_sim = df.copy()
+        df_sim.loc[df_sim.index == flip_row.name, target_col] = 1 - int(df_sim.loc[flip_row.name, target_col])
+        X_sim = df_sim[chosen_features]
+        y_sim = df_sim[target_col]
+        # scale same way
+        if use_scaler and num_cols_in_X:
+            s = StandardScaler(); X_sim[num_cols_in_X] = s.fit_transform(X_sim[num_cols_in_X])
+        Xtr, Xte, ytr, yte = train_test_split(X_sim, y_sim, test_size=test_size, random_state=random_state, stratify=y_sim if len(np.unique(y_sim))>1 else None)
+        lr_sim, rf_sim = train_models(Xtr, ytr, random_state)
+        acc_lr = lr_sim.score(Xte, yte)
+        acc_rf = rf_sim.score(Xte, yte)
+        st.write(f"After flip: Logistic Test accuracy = {acc_lr:.3f}; RandomForest Test accuracy = {acc_rf:.3f}")
+        st.info("This is a simple local experiment — flipping single rows can have small effects unless the dataset is tiny.")
+
+st.success("Interactive what-if tools ready. Adjust features / inputs and retrain to explore model behavior.")
+# app.py
 # -*- coding: utf-8 -*-
 # app.py
 # -*- coding: utf-8 -*-
