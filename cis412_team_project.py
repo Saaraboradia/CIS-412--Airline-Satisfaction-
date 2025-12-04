@@ -1,13 +1,8 @@
 # app.py
 """
-Interactive Streamlit app for CIS412 — What-If Dashboard
-Single-file app: upload CSV or use repo train.csv -> trains models -> interactive sliders -> live predictions
-Features:
- - robust slider -> model input alignment (handles one-hot-ish names)
- - scaler saved & applied to inputs
- - sensitivity ("what-if") tests
- - SHAP explainer if shap is installed; fallback to RF feature importances
- - debug toggle to show exact input sent to model
+Robust interactive Streamlit app for CIS412 — What-If Dashboard
+Replace your existing app with this file. It auto-trains and provides sliders, predictions,
+sensitivity analysis, and SHAP explanations (if shap is installed).
 """
 
 import os
@@ -24,13 +19,14 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.dummy import DummyClassifier
 from sklearn.metrics import accuracy_score, roc_auc_score, classification_report, confusion_matrix
 
 warnings.filterwarnings("ignore")
 sns.set_theme()
-st.set_page_config(layout="wide", page_title="CIS412 - What-If Dashboard")
+st.set_page_config(layout="wide", page_title="CIS412 - Interactive What-If Dashboard")
 
-# Optional SHAP import
+# Optional SHAP
 try:
     import shap
     HAS_SHAP = True
@@ -40,8 +36,8 @@ except Exception:
 # -------------------------
 # Helper functions
 # -------------------------
-def load_csv_from_uploaded_or_repo(uploaded) -> Optional[pd.DataFrame]:
-    """Load dataframe from uploaded file or fallback repo paths."""
+def load_csv(uploaded) -> Optional[pd.DataFrame]:
+    """Load dataframe from uploaded file or common repo paths."""
     if uploaded is not None:
         try:
             df = pd.read_csv(uploaded)
@@ -50,47 +46,83 @@ def load_csv_from_uploaded_or_repo(uploaded) -> Optional[pd.DataFrame]:
         except Exception as e:
             st.sidebar.error(f"Failed to read uploaded CSV: {e}")
             return None
-    # fallback file paths
-    fallback_paths = ["./train.csv", "./data/train.csv", "/content/sample_data/train.csv"]
-    for p in fallback_paths:
+    for p in ["./train.csv", "./data/train.csv", "/content/sample_data/train.csv"]:
         if os.path.exists(p):
             try:
                 df = pd.read_csv(p)
                 st.sidebar.info(f"Loaded CSV from {p}")
                 return df
             except Exception as e:
-                st.sidebar.error(f"Failed reading {p}: {e}")
+                st.sidebar.error(f"Failed to read {p}: {e}")
                 return None
     st.sidebar.warning("No CSV found. Upload train.csv via the uploader or add train.csv to the repo.")
     return None
 
-def detect_target(df: pd.DataFrame) -> Optional[str]:
-    """Try to detect the satisfaction target column."""
-    if 'satisfaction_satisfied' in df.columns:
-        return 'satisfaction_satisfied'
-    cands = [c for c in df.columns if 'satisfaction' in c.lower()]
-    if len(cands) == 1:
-        return cands[0]
-    for c in cands:
-        vals = set(df[c].dropna().unique())
-        if vals <= {0,1}:
-            return c
-    # fallback: if there's a column named 'satisfaction' exactly
-    if 'satisfaction' in df.columns:
-        return 'satisfaction'
-    return None
-
-def basic_preprocess(df: pd.DataFrame) -> pd.DataFrame:
+def detect_and_convert_target(df: pd.DataFrame, target_hint: Optional[str]=None) -> Optional[pd.Series]:
+    """Detect a satisfaction-like target and convert to integer Series."""
     df = df.copy()
-    # numeric impute median
+    # explicit hint
+    if target_hint and target_hint in df.columns:
+        col = df[target_hint]
+    else:
+        # prefer explicit name
+        candidates = [c for c in df.columns if 'satisfaction' in c.lower()]
+        if len(candidates) == 1:
+            col = df[candidates[0]]
+        elif 'satisfaction' in df.columns:
+            col = df['satisfaction']
+        else:
+            # try any binary-looking column
+            possible = []
+            for c in df.columns:
+                vals = df[c].dropna().unique()
+                if set(vals) <= {0,1} or set(map(str,vals)) <= {'0','1'}:
+                    possible.append(c)
+            if possible:
+                col = df[possible[0]]
+            else:
+                # give up - return None
+                return None
+
+    # now robustly convert col to binary ints
+    if pd.api.types.is_integer_dtype(col) or pd.api.types.is_float_dtype(col):
+        # coerce numeric (fill NaNs with mode or 0)
+        if col.isnull().any():
+            if not col.mode().empty:
+                col = col.fillna(col.mode().iloc[0])
+            else:
+                col = col.fillna(0)
+        try:
+            return col.astype(int).copy()
+        except Exception:
+            return pd.to_numeric(col, errors='coerce').fillna(0).astype(int).copy()
+    else:
+        # text labels: map contains('satisf') -> 1, contains('dissat'|'neutral'|'not') ->0; else factorize fallback
+        s = col.astype(str).str.strip().str.lower()
+        mapped = pd.Series([None]*len(s), index=s.index)
+        mapped[s.str.contains('satisf')] = 1
+        mapped[s.str.contains('dissat') | s.str.contains('not satisfied') | s.str.contains('unsatisf') | s.str.contains('disloyal') | s.str.contains('neutral')] = 0
+        if mapped.notna().sum() >= max(2, int(0.05 * len(mapped))):  # if mapping worked for some reasonable fraction
+            # fill remaining with mode (if any)
+            if mapped.mode().shape[0] > 0:
+                mapped = mapped.fillna(mapped.mode().iloc[0])
+            else:
+                mapped = mapped.fillna(0)
+            return mapped.astype(int).copy()
+        # fallback: factorize into integer codes
+        codes, uniques = pd.factorize(col)
+        st.warning(f"Target column was non-numeric and mapping heuristics incomplete. Factorized into integer codes; uniques: {list(uniques)}")
+        return pd.Series(codes, index=col.index).astype(int).copy()
+
+def basic_impute(df: pd.DataFrame) -> pd.DataFrame:
+    """Impute numeric NaN by median, categorical NaN by mode; clamp negative delays."""
+    df = df.copy()
     for c in df.select_dtypes(include=[np.number]).columns:
         if df[c].isnull().any():
             df[c].fillna(df[c].median(), inplace=True)
-    # categorical impute mode
     for c in df.select_dtypes(include=['object','category']).columns:
         if df[c].isnull().any() and df[c].mode().shape[0]:
-            df[c].fillna(df[c].mode()[0], inplace=True)
-    # clamp negative delays if present
+            df[c].fillna(df[c].mode().iloc[0], inplace=True)
     for d in ['Departure Delay in Minutes','Arrival Delay in Minutes']:
         if d in df.columns:
             df[d] = df[d].apply(lambda x: x if pd.isna(x) else max(x,0))
@@ -113,134 +145,161 @@ def plot_rf_importances(rf_model, feature_names):
     st.pyplot(fig)
 
 # -------------------------
-# Main UI & flow
+# UI: sidebar controls
 # -------------------------
-st.title("CIS412 — Interactive What-If Dashboard")
-st.write("Upload `train.csv` or place `train.csv` in the repo root. Use the sidebar to control options.")
+st.sidebar.title("CIS412 — Controls")
+uploaded = st.sidebar.file_uploader("Upload train.csv (optional)", type=["csv"], key="uploader_main")
+scale_numeric = st.sidebar.checkbox("Scale numeric features", value=True, key="scale_num")
+test_size = st.sidebar.slider("Test size", 0.05, 0.5, 0.2, 0.05, key="test_size")
+random_state = int(st.sidebar.number_input("Random seed", value=42, step=1, key="rand_seed"))
+show_debug = st.sidebar.checkbox("Show prediction debug info", value=False, key="show_debug")
+use_shap = st.sidebar.checkbox("Enable SHAP (may be slow)", value=False, key="use_shap")
 
-# single uploader with explicit key (avoid duplicate IDs)
-uploaded_file = st.sidebar.file_uploader("Upload train.csv (optional)", type=["csv"], key="uploader_main")
-
-# other sidebar options
-st.sidebar.markdown("---")
-scale_numeric = st.sidebar.checkbox("Scale numeric features", value=True)
-test_size = st.sidebar.slider("Test size", 0.05, 0.5, 0.2, 0.05)
-random_state = int(st.sidebar.number_input("Random seed", value=42, step=1))
-show_debug = st.sidebar.checkbox("Show prediction debug info", value=False)
-use_shap = st.sidebar.checkbox("Compute SHAP (may be slow)", value=False)
-
-# Load data
-df_raw = load_csv_from_uploaded_or_repo(uploaded_file)
+# -------------------------
+# Load & preprocess data
+# -------------------------
+df_raw = load_csv(uploaded)
 if df_raw is None:
+    st.title("CIS412 — Interactive What-If Dashboard")
+    st.write("Upload `train.csv` using the uploader in the sidebar or add `train.csv` to the repo root.")
     st.stop()
 
-st.subheader("Raw data preview")
+st.header("Raw Data Preview")
 st.write(f"Shape: {df_raw.shape}")
 st.dataframe(df_raw.head())
 
-# basic preprocessing
-df_clean = basic_preprocess(df_raw)
+df_clean = basic_impute(df_raw)
 
-# detect target
-target_col = detect_target(df_clean)
-if target_col is None:
-    st.error("Could not detect a satisfaction-like target column. Please ensure a column named 'satisfaction' or 'satisfaction_satisfied' (binary) exists.")
+# detect & convert target
+y_series = detect_and_convert_target(df_clean)
+if y_series is None:
+    st.error("Could not automatically detect a satisfaction-like target column. Ensure a 'satisfaction' or 'satisfaction_satisfied' column exists, or edit code to specify the target.")
     st.stop()
-st.write("Detected target:", target_col)
 
-# one-hot encode categorical columns (except the target)
-obj_cols = [c for c in df_clean.select_dtypes(include=['object','category']).columns if c != target_col]
+target_col = y_series.name if y_series.name else "target"
+# if detect_and_convert_target returned a Series without name, assign a temporary name
+if target_col not in df_clean.columns:
+    # prefer prior columns containing 'satisfaction' to show which was used
+    cand = [c for c in df_clean.columns if 'satisfaction' in c.lower()]
+    if cand:
+        target_col = cand[0]
+
+# append converted target to processed df
+df_processed = df_clean.copy()
+df_processed['_target_converted'] = y_series.values
+y_full = df_processed['_target_converted']
+
+st.write("Detected/converted target distribution:")
+st.write(pd.Series(y_full).value_counts().to_frame('count'))
+
+# one-hot encode remaining categorical columns (excluding our _target_converted)
+obj_cols = [c for c in df_processed.select_dtypes(include=['object','category']).columns if c != '_target_converted']
 if obj_cols:
-    df_processed = pd.get_dummies(df_clean, columns=obj_cols, drop_first=True)
-else:
-    df_processed = df_clean.copy()
+    df_processed = pd.get_dummies(df_processed, columns=obj_cols, drop_first=True)
 
-# feature selection defaults
-all_features = [c for c in df_processed.columns if c != target_col]
-# heuristic: pick rating-like columns first
+# features list (exclude the target helper column)
+all_features = [c for c in df_processed.columns if c != '_target_converted']
+
+# heuristic default features (service-like)
 rating_keywords = ['inflight','wifi','checkin','food','clean','baggage','seat','boarding','comfort','entertainment','service','leg room','ease','gate']
 service_candidates = [c for c in df_clean.columns if any(k in c.lower() for k in rating_keywords) and pd.api.types.is_numeric_dtype(df_clean[c])]
-service_candidates = [c for c in service_candidates if c in all_features]  # ensure present after encoding
+service_candidates = [c for c in service_candidates if c in all_features]
 default_features = service_candidates + [c for c in all_features if c not in service_candidates][:20]
 
 st.sidebar.header("Model features")
-chosen_features = st.sidebar.multiselect("Features to include (choose at least 1)", options=all_features, default=default_features[:min(20,len(default_features))])
-
+chosen_features = st.sidebar.multiselect("Features to include for modeling", options=all_features, default=default_features[:min(20,len(default_features))], key="chosen_feats")
 if not chosen_features:
-    st.error("Please select at least one feature in the sidebar.")
+    st.error("Select at least one feature in the sidebar to proceed.")
     st.stop()
 
-# Prepare X,y
+# Prepare modeling data (X_full, y_full)
 X_full = df_processed[chosen_features].copy()
-# --- robust target conversion (replace the previous single-line astype(int) ) ---
-target_series = df_processed[target_col].copy()
+y_full = y_full.astype(int).copy()
 
-# If already numeric-ish, coerce to int (safely)
-if pd.api.types.is_integer_dtype(target_series) or pd.api.types.is_float_dtype(target_series):
-    # fill NaNs with mode/0 then convert
-    if target_series.isnull().any():
-        if not target_series.mode().empty:
-            target_series = target_series.fillna(target_series.mode().iloc[0])
-        else:
-            target_series = target_series.fillna(0)
-    try:
-        y_full = target_series.astype(int).copy()
-    except Exception:
-        # fallback to coercion
-        y_full = pd.to_numeric(target_series, errors='coerce').fillna(0).astype(int).copy()
-else:
-    # Try mapping common textual labels to binary
-    # common positive labels
-    pos_labels = {'satisfied','satisfied ','satisfied\n','satisfied\r','satisfied.' , 'satisfying', 'satisfied_customer', 'satisfiedcustomer', 'satisfied_customer ' }
-    # common negative / not-satisfied labels
-    neg_labels = {'neutral','dissatisfied','neutral/dissatisfied','disloyal','unsatisfied','not satisfied','not_satisfied','neutral '}
-    # build mapping that is case-insensitive & stripped
-    mapped = target_series.astype(str).str.strip().str.lower().map(
-        lambda s: 1 if s in pos_labels else (0 if s in neg_labels else None)
-    )
+# -------------------------
+# Robust train: impute/clean numeric, check classes, fit models
+# -------------------------
+# train/test split
+X_train, X_test, y_train, y_test = train_test_split(X_full, y_full, test_size=test_size, random_state=random_state, stratify=y_full if y_full.nunique()>1 else None)
 
-    # If mapping produced only 0/1 (or with NaNs), fill NaNs by trying heuristic:
-    if set(mapped.dropna().unique()) <= {0, 1} and mapped.notna().sum() > 0:
-        # Fill remaining NaNs with mode of mapped if available, else 0
-        if mapped.mode().shape[0] > 0:
-            mapped = mapped.fillna(mapped.mode().iloc[0])
-        else:
-            mapped = mapped.fillna(0)
-        y_full = mapped.astype(int).copy()
-    else:
-        # Fallback: factorize (will produce 0,1,2,...). If >2 classes, warn and choose binary via factorize result
-        codes, uniques = pd.factorize(target_series)
-        st.warning(f"Target column '{target_col}' was non-numeric; factorizing into integer codes. Unique labels: {list(uniques)}")
-        # If factorization produced >2 labels, you may want to manually map them — currently we'll keep codes as-is.
-        y_full = pd.Series(codes, index=target_series.index, name=target_col).astype(int).copy()
+# replace inf with nan and impute medians for any leftover NaN
+def clean_impute_df(df_to_clean: pd.DataFrame, ref: Optional[pd.DataFrame]=None) -> pd.DataFrame:
+    dfc = df_to_clean.copy()
+    dfc.replace([np.inf, -np.inf], np.nan, inplace=True)
+    for c in dfc.columns:
+        if dfc[c].isnull().any():
+            med = (ref[c].median() if (ref is not None and c in ref.columns) else dfc[c].median())
+            dfc[c].fillna(med, inplace=True)
+    return dfc
 
-# Quick sanity check and debug help: show the unique values found (only if the debug sidebar option is enabled)
-if 'show_debug' in locals() and show_debug:
-    st.write("DEBUG — target column processed unique values (sample):")
-    st.write(pd.Series(y_full).value_counts().to_frame(name='count'))
+X_train = clean_impute_df(X_train)
+X_test  = clean_impute_df(X_test, ref=X_train)
 
-# Now y_full is an integer Series suitable for modeling
-
-
-# split & scale (auto-train on load)
-X_train, X_test, y_train, y_test = train_test_split(X_full, y_full, test_size=test_size, random_state=random_state, stratify=y_full if len(y_full.unique())>1 else None)
+# ensure numeric dtypes for model columns; drop anything non-convertible
+to_drop = []
+for col in X_train.columns:
+    if not pd.api.types.is_numeric_dtype(X_train[col]):
+        try:
+            X_train[col] = pd.to_numeric(X_train[col], errors='coerce')
+            X_test[col]  = pd.to_numeric(X_test[col], errors='coerce')
+            # if still NaN after coercion, fill with median
+            if X_train[col].isnull().any():
+                X_train[col].fillna(X_train[col].median(), inplace=True)
+            if X_test[col].isnull().any():
+                X_test[col].fillna(X_train[col].median(), inplace=True)
+        except Exception:
+            to_drop.append(col)
+if to_drop:
+    st.warning(f"Dropping non-numeric columns from features: {to_drop}")
+    X_train.drop(columns=to_drop, inplace=True)
+    X_test.drop(columns=to_drop, inplace=True)
 
 numeric_cols = [c for c in X_train.columns if pd.api.types.is_numeric_dtype(X_train[c])]
+
+# scaling
 scaler = None
 if scale_numeric and numeric_cols:
     scaler = StandardScaler()
     X_train[numeric_cols] = scaler.fit_transform(X_train[numeric_cols])
-    X_test[numeric_cols] = scaler.transform(X_test[numeric_cols])
+    X_test[numeric_cols]  = scaler.transform(X_test[numeric_cols])
 
-# Train models
-lr = LogisticRegression(max_iter=2000)
-rf = RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1)
-lr.fit(X_train, y_train)
-rf.fit(X_train, y_train)
+# show class counts for debugging
+st.write("Target class distribution (train):")
+st.write(pd.Series(y_train).value_counts().to_frame('count'))
 
-# Save into session state for later use
-st.session_state['lr_model'] = lr
-st.session_state['rf_model'] = rf
+# Fit models robustly; if only one class present, fallback to DummyClassifier
+n_classes = y_train.nunique()
+if n_classes <= 1:
+    st.warning("y_train contains only one class; training a DummyClassifier that predicts the majority class. Create/use data with both classes for a meaningful classifier.")
+    dummy = DummyClassifier(strategy="most_frequent")
+    dummy.fit(X_train, y_train)
+    lr_model = dummy
+    rf_model = dummy
+    st.session_state['model_is_dummy'] = True
+else:
+    try:
+        if n_classes > 2:
+            lr_model = LogisticRegression(multi_class='multinomial', solver='lbfgs', max_iter=5000)
+        else:
+            lr_model = LogisticRegression(max_iter=2000)
+        lr_model.fit(X_train, y_train)
+    except Exception as e:
+        st.error(f"LogisticRegression failed to fit: {e}. Falling back to DummyClassifier.")
+        lr_model = DummyClassifier(strategy="most_frequent")
+        lr_model.fit(X_train, y_train)
+
+    try:
+        rf_model = RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1)
+        rf_model.fit(X_train, y_train)
+    except Exception as e:
+        st.error(f"RandomForest failed to fit: {e}. Falling back to DummyClassifier.")
+        rf_model = DummyClassifier(strategy="most_frequent")
+        rf_model.fit(X_train, y_train)
+    st.session_state['model_is_dummy'] = False
+
+# Save models & metadata
+st.session_state['lr_model'] = lr_model
+st.session_state['rf_model'] = rf_model
 st.session_state['scaler'] = scaler
 st.session_state['model_feature_order'] = X_train.columns.tolist()
 st.session_state['X_train'] = X_train
@@ -248,10 +307,9 @@ st.session_state['X_test'] = X_test
 st.session_state['y_train'] = y_train
 st.session_state['y_test'] = y_test
 
-st.success("Models trained (auto). Use sliders below to run what-if predictions.")
+st.success("Models ready. Use sliders below to perform what-if predictions.")
 
-# quick metrics
-st.subheader("Quick performance metrics (on test set)")
+# quick performance table
 def quick_stats(m, Xtr, Xte, ytr, yte):
     tr = m.score(Xtr, ytr)
     te = m.score(Xte, yte)
@@ -261,8 +319,10 @@ def quick_stats(m, Xtr, Xte, ytr, yte):
         te_auc = np.nan
     return tr, te, te_auc
 
-lr_tr, lr_te, lr_auc = quick_stats(lr, X_train, X_test, y_train, y_test)
-rf_tr, rf_te, rf_auc = quick_stats(rf, X_train, X_test, y_train, y_test)
+lr_tr, lr_te, lr_auc = quick_stats(lr_model, X_train, X_test, y_train, y_test)
+rf_tr, rf_te, rf_auc = quick_stats(rf_model, X_train, X_test, y_train, y_test)
+
+st.subheader("Performance (quick)")
 st.write(pd.DataFrame({
     'Model':['Logistic','RandomForest'],
     'Train acc':[lr_tr, rf_tr],
@@ -271,21 +331,20 @@ st.write(pd.DataFrame({
 }).set_index('Model'))
 
 # -------------------------
-# Build sliders UI
+# Interactive sliders (expose service columns)
 # -------------------------
-st.header("Interactive sliders (service ratings)")
-st.write("Sliders override a base input (median values). Move sliders and observe live predictions.")
+st.header("Interactive sliders — tweak service features")
 
-# determine slider candidates: prefer service candidates present in chosen_features, else top numeric features
+# choose slider candidates: prefer service_candidates (raw names) that survived to chosen_features,
+# otherwise pick top numeric features
 slider_candidates = [c for c in service_candidates if c in chosen_features]
 if not slider_candidates:
     slider_candidates = [c for c in chosen_features if pd.api.types.is_numeric_dtype(X_full[c])][:8]
 
-# build sliders
 slider_values: Dict[str, Any] = {}
-cols = st.columns(2)
+cols_left, cols_right = st.columns(2)
 for i, feat in enumerate(slider_candidates):
-    col = cols[i % 2]
+    col = cols_left if i % 2 == 0 else cols_right
     if feat in df_raw.columns and pd.api.types.is_numeric_dtype(df_raw[feat]):
         lo = int(df_raw[feat].min()); hi = int(df_raw[feat].max()); default = int(df_raw[feat].median())
     else:
@@ -293,9 +352,9 @@ for i, feat in enumerate(slider_candidates):
         lo = int(ser.min()) if pd.api.types.is_numeric_dtype(ser) else 0
         hi = int(ser.max()) if pd.api.types.is_numeric_dtype(ser) else 5
         default = int(ser.median()) if pd.api.types.is_numeric_dtype(ser) else 0
-    slider_values[feat] = col.slider(feat, min_value=lo, max_value=hi, value=default, step=1)
+    slider_values[feat] = col.slider(feat, min_value=lo, max_value=hi, value=default, step=1, key=f"slider_{feat}")
 
-with st.expander("Edit other numeric features (optional)"):
+with st.expander("Edit additional numeric features (optional)"):
     other_numeric = [c for c in chosen_features if c not in slider_candidates and pd.api.types.is_numeric_dtype(X_full[c])]
     other_inputs = {}
     cols2 = st.columns(2)
@@ -304,24 +363,19 @@ with st.expander("Edit other numeric features (optional)"):
         ser = X_full[feat]
         lo, hi = float(ser.min()), float(ser.max())
         default = float(ser.median())
-        other_inputs[feat] = col.number_input(feat, value=default, min_value=lo, max_value=hi)
+        other_inputs[feat] = col.number_input(feat, value=default, min_value=lo, max_value=hi, key=f"num_{feat}")
 
 # -------------------------
-# Build input vector robustly
+# Build model input from sliders robustly and predict
 # -------------------------
 st.header("Live prediction")
-threshold = st.slider("Threshold for class=1", 0.01, 0.99, 0.5, 0.01)
+threshold = st.slider("Decision threshold (to produce class=1)", 0.01, 0.99, 0.5, 0.01, key="threshold")
 
 model_feats: List[str] = st.session_state['model_feature_order']
-# base inputs = medians of training data (unscaled medians)
-base_input = {}
-for f in model_feats:
-    if f in X_full.columns:
-        base_input[f] = float(X_full[f].median())
-    else:
-        base_input[f] = 0.0
+# base input = medians from X_train (unscaled)
+base_input = {f: float(pd.to_numeric(X_full[f], errors='coerce').median()) if f in X_full.columns else 0.0 for f in model_feats}
 
-# apply slider overrides
+# override with slider values (exact match or fuzzy match)
 for sname, sval in slider_values.items():
     if sname in base_input:
         base_input[sname] = float(sval)
@@ -331,64 +385,70 @@ for sname, sval in slider_values.items():
         for mm in matches:
             base_input[mm] = float(sval)
 
-# other numeric overrides
+# override with other numeric inputs
 for name, val in (other_inputs.items() if 'other_inputs' in locals() else {}):
     if name in base_input:
         base_input[name] = float(val)
 
-# build DataFrame in model order
+# build input_df and ensure column order
 input_df = pd.DataFrame([base_input], columns=model_feats)
 
-# scale with saved scaler if present
+# scale numeric columns using saved scaler
 scaler_saved = st.session_state.get('scaler', None)
-if scaler_saved is not None and numeric_cols:
+numeric_cols_model = [c for c in model_feats if pd.api.types.is_numeric_dtype(X_train[c]) if c in X_train.columns]
+if scaler_saved is not None and len(numeric_cols_model) > 0:
     try:
-        input_df[numeric_cols] = scaler_saved.transform(input_df[numeric_cols])
+        input_df[numeric_cols_model] = scaler_saved.transform(input_df[numeric_cols_model])
     except Exception:
-        # fallback: attempt to fit a quick scaler on X_train numeric and transform
+        # fallback try fit on saved data and transform
         try:
-            tmp_s = StandardScaler()
-            tmp_s.fit(pd.concat([st.session_state['X_train'][numeric_cols], st.session_state['X_test'][numeric_cols]], axis=0))
-            input_df[numeric_cols] = tmp_s.transform(input_df[numeric_cols])
-            st.session_state['scaler'] = tmp_s
+            tmp = StandardScaler()
+            tmp.fit(pd.concat([st.session_state['X_train'][numeric_cols_model], st.session_state['X_test'][numeric_cols_model]], axis=0))
+            input_df[numeric_cols_model] = tmp.transform(input_df[numeric_cols_model])
+            st.session_state['scaler'] = tmp
         except Exception:
             pass
 
 if show_debug:
-    st.subheader("Debug: input passed to model")
-    st.write("Model feature order (len={}):".format(len(model_feats)))
+    st.subheader("Debug: input passed to model (post-scaling)")
+    st.write("Model features (order):")
     st.write(model_feats)
     st.dataframe(input_df.T)
 
-# Predictions
-prob_lr = lr.predict_proba(input_df)[:,1][0]
-prob_rf = rf.predict_proba(input_df)[:,1][0]
+# Predict probabilities
+try:
+    prob_lr = float(st.session_state['lr_model'].predict_proba(input_df)[:,1][0])
+    prob_rf = float(st.session_state['rf_model'].predict_proba(input_df)[:,1][0])
+except Exception as e:
+    st.error(f"Prediction failed: {e}")
+    st.stop()
+
 cls_lr = int(prob_lr >= threshold)
 cls_rf = int(prob_rf >= threshold)
 
-st.write("Predicted probabilities (reflect slider inputs):")
+st.subheader("Predicted probabilities (reflect slider inputs)")
 plot_prob_bar(prob_lr, prob_rf)
-st.write(f"Logistic predicted class: {cls_lr}  |  RandomForest predicted class: {cls_rf}")
+st.write(f"Logistic predicted class: {cls_lr} | RandomForest predicted class: {cls_rf}")
 
 with st.expander("Show test set classification reports & confusion matrices"):
     st.write("Logistic regression (test):")
-    st.text(classification_report(y_test, lr.predict(X_test), zero_division=0))
+    st.text(classification_report(y_test, st.session_state['lr_model'].predict(X_test), zero_division=0))
     st.write("Confusion matrix (Logistic):")
-    st.write(confusion_matrix(y_test, lr.predict(X_test)))
+    st.write(confusion_matrix(y_test, st.session_state['lr_model'].predict(X_test)))
     st.write("Random Forest (test):")
-    st.text(classification_report(y_test, rf.predict(X_test), zero_division=0))
+    st.text(classification_report(y_test, st.session_state['rf_model'].predict(X_test), zero_division=0))
     st.write("Confusion matrix (RF):")
-    st.write(confusion_matrix(y_test, rf.predict(X_test)))
+    st.write(confusion_matrix(y_test, st.session_state['rf_model'].predict(X_test)))
 
 # -------------------------
-# Sensitivity analysis
+# Sensitivity (one-click tweak)
 # -------------------------
-st.header("Sensitivity / What-if")
+st.header("Sensitivity / What-if (one-click)")
 if slider_values:
-    s_feature = st.selectbox("Feature to tweak", options=list(slider_values.keys()))
+    s_feature = st.selectbox("Feature to tweak", options=list(slider_values.keys()), key="s_feature_select")
     current_val = base_input.get(s_feature, 0.0)
-    new_val = st.number_input(f"Tweak {s_feature} to", value=int(current_val))
-    if st.button("Run sensitivity (compare before / after)"):
+    new_val = st.number_input(f"New value for {s_feature}", value=int(current_val), key="s_new_val")
+    if st.button("Run sensitivity (compare before/after)", key="run_sens"):
         new_input = base_input.copy()
         if s_feature in new_input:
             new_input[s_feature] = float(new_val)
@@ -398,43 +458,46 @@ if slider_values:
             for mm in matches:
                 new_input[mm] = float(new_val)
         new_df = pd.DataFrame([new_input], columns=model_feats)
-        if scaler_saved is not None and numeric_cols:
+        if scaler_saved is not None and len(numeric_cols_model) > 0:
             try:
-                new_df[numeric_cols] = scaler_saved.transform(new_df[numeric_cols])
+                new_df[numeric_cols_model] = scaler_saved.transform(new_df[numeric_cols_model])
             except Exception:
                 pass
-        new_prob_lr = lr.predict_proba(new_df)[:,1][0]
-        new_prob_rf = rf.predict_proba(new_df)[:,1][0]
+        new_prob_lr = float(st.session_state['lr_model'].predict_proba(new_df)[:,1][0])
+        new_prob_rf = float(st.session_state['rf_model'].predict_proba(new_df)[:,1][0])
         st.write(f"Logistic prob change: {new_prob_lr - prob_lr:+.4f} ({prob_lr:.4f} → {new_prob_lr:.4f})")
         st.write(f"RandomForest prob change: {new_prob_rf - prob_rf:+.4f} ({prob_rf:.4f} → {new_prob_rf:.4f})")
 
 # -------------------------
-# Feature importance / SHAP
+# SHAP or RF importances
 # -------------------------
 st.header("Feature importance & explanation")
 if use_shap and HAS_SHAP:
     try:
         st.write("Computing SHAP values (TreeExplainer on RF). This may take a moment.")
-        explainer = shap.TreeExplainer(rf)
-        sample = X_train.sample(n=min(200, X_train.shape[0]), random_state=1)
-        shap_vals = explainer.shap_values(sample)[1] if isinstance(explainer.shap_values(sample), list) else explainer.shap_values(sample)
-        mean_abs = np.abs(shap_vals).mean(axis=0)
+        explainer = shap.TreeExplainer(st.session_state['rf_model'])
+        sample = st.session_state['X_train'].sample(n=min(200, st.session_state['X_train'].shape[0]), random_state=1)
+        shap_vals = explainer.shap_values(sample)
+        # shap_vals may be list for binary
+        arr = shap_vals[1] if isinstance(shap_vals, list) else shap_vals
+        mean_abs = np.abs(arr).mean(axis=0)
         s = pd.Series(mean_abs, index=sample.columns).sort_values(ascending=True).tail(30)
         fig, ax = plt.subplots(figsize=(8, max(3, len(s)*0.25)))
         s.plot(kind='barh', ax=ax)
-        ax.set_title("Top mean |SHAP value|")
+        ax.set_title("Top mean |SHAP value| (RF)")
         st.pyplot(fig)
-        # local explanation
-        local_shap = explainer.shap_values(input_df)[1] if isinstance(explainer.shap_values(input_df), list) else explainer.shap_values(input_df)
-        df_local = pd.DataFrame(local_shap.reshape(1,-1), columns=input_df.columns).T
+        # local explanation for current input
+        local = explainer.shap_values(input_df)
+        local_arr = local[1] if isinstance(local, list) else local
+        df_local = pd.DataFrame(local_arr.reshape(1,-1), columns=input_df.columns).T
         df_local.columns = ['SHAP value']
         st.subheader("Local SHAP values (current input)")
         st.dataframe(df_local.sort_values('SHAP value', ascending=False))
     except Exception as e:
-        st.warning(f"SHAP failed: {e}. Showing RF importances instead.")
-        plot_rf_importances(rf, X_train.columns)
+        st.warning(f"SHAP computation failed: {e}. Showing RF importances instead.")
+        plot_rf_importances(st.session_state['rf_model'], st.session_state['X_train'].columns)
 else:
     st.info("SHAP not enabled or not installed. Displaying RandomForest feature importances.")
-    plot_rf_importances(rf, X_train.columns)
+    plot_rf_importances(st.session_state['rf_model'], st.session_state['X_train'].columns)
 
-st.success("Interactive dashboard ready — move sliders, run sensitivity, enable debug for detailed input mapping.")
+st.success("App ready — move sliders, run sensitivity, and enable debug to view exact model inputs.")
