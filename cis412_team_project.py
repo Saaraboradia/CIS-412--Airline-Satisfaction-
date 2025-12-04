@@ -94,7 +94,7 @@ def plot_feature_importances_from_rf(rf, feature_names):
 # UI - sidebar
 # -------------------------
 st.sidebar.header("Dataset & app options")
-uploaded_file = st.sidebar.file_uploader("Upload train.csv (optional)", type=["csv"])
+uploaded = st.sidebar.file_uploader("Upload train.csv (optional)", type=["csv"], key="uploader_main")
 df_raw = load_csv(uploaded_file)
 st.sidebar.write("Dataset shape:", df_raw.shape)
 
