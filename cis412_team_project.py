@@ -415,8 +415,122 @@ cls_rf = int(prob_rf >= threshold)
 st.subheader("Predicted probabilities (reflect slider inputs)")
 plot_prob_bar(prob_lr, prob_rf)
 st.write(f"Logistic predicted class: {cls_lr} | RandomForest predicted class: {cls_rf}")
-prob_lr = lr.predict_proba(input_scaled)[0, 1]
-prob_rf = rf.predict_proba(input_scaled)[0, 1]
+# --- Robust prediction block (drop-in replacement) ---
+import math
+
+# 1) Build X_input (prefer scaled input if available)
+if 'input_scaled' in locals():
+    X_input = input_scaled.copy()
+elif 'input_df' in locals():
+    X_input = input_df.copy()
+else:
+    # Try to construct from base_input and model_feature_order in session_state
+    base_input = st.session_state.get('base_input', None)
+    model_feats = st.session_state.get('model_feature_order', None)
+    if base_input is not None and model_feats is not None:
+        X_input = pd.DataFrame([base_input], columns=model_feats)
+    else:
+        st.error("Unable to construct model input. Make sure `input_df` or `input_scaled` exists.")
+        X_input = None
+
+if X_input is not None:
+    # 2) Ensure columns are in the model order (if available)
+    model_feats = st.session_state.get('model_feature_order')
+    if model_feats:
+        # reindex to model order and fill missing with zeros
+        X_input = X_input.reindex(columns=model_feats, fill_value=0)
+
+    # 3) If not already scaled and a scaler exists, apply it
+    scaler_saved = st.session_state.get('scaler', None)
+    if scaler_saved is not None and ('input_scaled' not in locals()):
+        # figure out numeric columns from X_train if available
+        numeric_cols = [c for c in X_input.columns if c in st.session_state.get('X_train', pd.DataFrame()).columns and pd.api.types.is_numeric_dtype(st.session_state['X_train'][c])]
+        if numeric_cols:
+            try:
+                X_input[numeric_cols] = scaler_saved.transform(X_input[numeric_cols])
+            except Exception:
+                # fallback: do nothing
+                pass
+
+    # 4) Find model objects robustly
+    # Logistic model
+    lr_model = None
+    if 'lr' in globals():
+        lr_model = globals()['lr']
+    elif 'lr_model' in globals():
+        lr_model = globals()['lr_model']
+    else:
+        lr_model = st.session_state.get('lr_model') or st.session_state.get('model_lr')
+
+    # Random forest model
+    rf_model = None
+    if 'rf' in globals():
+        rf_model = globals()['rf']
+    elif 'rf_model' in globals():
+        rf_model = globals()['rf_model']
+    else:
+        rf_model = st.session_state.get('rf_model') or st.session_state.get('model_rf')
+
+    # 5) Predict probabilities (handle missing predict_proba)
+    def safe_proba(model, X):
+        if model is None:
+            return math.nan
+        # If model has predict_proba
+        if hasattr(model, 'predict_proba'):
+            try:
+                return float(model.predict_proba(X)[:, 1][0])
+            except Exception:
+                # fallback to predict -> 0/1
+                try:
+                    return float(model.predict(X)[0])
+                except Exception:
+                    return math.nan
+        else:
+            # no predict_proba -> fallback to predict
+            try:
+                return float(model.predict(X)[0])
+            except Exception:
+                return math.nan
+
+    prob_lr = safe_proba(lr_model, X_input)
+    prob_rf = safe_proba(rf_model, X_input)
+
+    # 6) Show results (use RF as main)
+    st.subheader("Predicted Probability of Satisfaction")
+    if math.isnan(prob_lr):
+        st.warning("Logistic regression probability not available.")
+    else:
+        st.write(f"**Logistic Regression:** {prob_lr:.3f}")
+
+    if math.isnan(prob_rf):
+        st.warning("Random Forest probability not available.")
+    else:
+        st.write(f"**Random Forest:** {prob_rf:.3f}")
+
+    # 7) Display friendly final prediction result (use Random Forest by default)
+    # Let user control threshold earlier (if you have one), else default 0.5
+    threshold_val = locals().get('threshold', None) or globals().get('threshold', None) or st.session_state.get('threshold', 0.5)
+    try:
+        threshold_val = float(threshold_val)
+    except Exception:
+        threshold_val = 0.5
+
+    # Prefer RF for final decision; fallback to LR then fallback to predict if neither
+    final_prob = prob_rf if (not math.isnan(prob_rf)) else (prob_lr if (not math.isnan(prob_lr)) else math.nan)
+
+    if math.isnan(final_prob):
+        st.error("No valid model probability available to determine 'Satisfied' vs 'Not Satisfied'.")
+    else:
+        final_class = 1 if final_prob >= threshold_val else 0
+        if final_class == 1:
+            st.success(f"🎉 Final prediction: **SATISFIED** (probability = {final_prob:.3f}, threshold = {threshold_val})")
+        else:
+            st.error(f"⚠️ Final prediction: **NOT SATISFIED** (probability = {final_prob:.3f}, threshold = {threshold_val})")
+else:
+    # X_input construction failed earlier
+    st.error("Prediction skipped: couldn't build model input.")
+# --- end robust prediction block ---
+
 # ---- Prediction Result Section ----
 st.subheader("Final Prediction Result")
 
@@ -483,4 +597,5 @@ else:
     plot_rf_importances(st.session_state['rf_model'], st.session_state['X_train'].columns)
 
 st.success("Interactive dashboard ready — move sliders and view live confusion matrix graphics.")
+
 
